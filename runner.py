@@ -122,6 +122,8 @@ def _build_cmd(config: dict, password: str) -> list:
 
     if config.get("folders_only"):
         cmd += ["-Fo"]
+    if config.get("flag_sensitive"):
+        cmd += ["-Fs"]
     if config.get("custom_folders"):
         cmd += ["-Cu"] + config["custom_folders"]
     if config.get("report_dir"):
@@ -132,6 +134,8 @@ def _build_cmd(config: dict, password: str) -> list:
         cmd += ["--dc", config["dc"]]
     if config.get("threads"):
         cmd += ["--threads", str(config["threads"])]
+    if config.get("level"):
+        cmd += ["--level", str(config["level"])]
 
     return cmd
 

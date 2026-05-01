@@ -992,10 +992,12 @@ def smb_walk_files_with_dfs(root_unc: str,
                             dfs_quarantine_secs: int,
                             start_time: float,
                             sensitive_folders: set[str] | None = None,
-                            folders_only: bool = False):
+                            folders_only: bool = False,
+                            max_depth: int = 0):
     root_unc = normalise_unc(root_unc)
     parts = [p for p in root_unc.split("\\") if p]
     _custom = sensitive_folders or set()
+    root_depth = len([p for p in root_unc.split("\\") if p])
 
     segments: list[tuple[str, int | None]] = [("(share-root)", None)]
     if len(parts) >= 3:
@@ -1058,6 +1060,7 @@ def smb_walk_files_with_dfs(root_unc: str,
                 yield file_unc
                 status_update(tracker, start_time)
 
+        cur_depth = len([p for p in dir_unc.split("\\") if p]) - root_depth
         for d in sorted(dirs, key=lambda x: x.name.lower()):
             next_unc = dir_unc + "\\" + d.name
 
@@ -1069,6 +1072,9 @@ def smb_walk_files_with_dfs(root_unc: str,
                     rw_label = f"READ={'YES' if can_read else 'NO'} WRITE={'YES' if can_write else 'NO'}"
                     safe_print(Fore.MAGENTA + f"[FOLDER] {reason}: {next_unc} [{rw_label}]")
                     tracker.add_folder_hit(next_unc, d.name, reason, can_read, can_write)
+
+            if max_depth and cur_depth >= max_depth:
+                continue
 
             next_segs = segs[:] + [(d.name, None)]
             yield from walk_dir(next_unc, next_segs)
@@ -1137,35 +1143,53 @@ def smb_walk_folders_threaded(root_unc: str,
                                dfs_qsecs: int,
                                start_time: float,
                                sensitive_folders: set,
-                               max_workers: int):
-    """BFS directory walk using a thread pool. Only probes folder ACLs — no file work."""
+                               max_workers: int,
+                               max_depth: int = 0,
+                               flag_sensitive: bool = False):
+    """BFS directory walk using a thread pool. Only probes folder ACLs - no file work.
+    max_depth:      max levels below root to recurse (0 = unlimited).
+    flag_sensitive: only add folder_hit entries for FIXED_SENSITIVE matches;
+                    all other folders appear only in the All Directories table.
+    """
     _custom = sensitive_folders or set()
     work_q  = queue.Queue()
-    work_q.put(root_unc)
+    work_q.put((root_unc, 0))  # (path, depth)
 
     def process_dir():
         while True:
-            dir_unc = work_q.get()
+            dir_unc, depth = work_q.get()
             try:
                 entries = smb_scandir_with_retry(
                     dir_unc, debug, tracker, limiter, conn_timeout, dfs_qmax, dfs_qsecs)
                 if entries is None:
-                    tracker.add_dir(dir_unc, accessible=False, write=False)
+                    if not flag_sensitive:
+                        tracker.add_dir(dir_unc, accessible=False, write=False)
                     continue
 
-                # Confirmed readable — probe write access for this directory
+                # Confirmed readable - probe write access for this directory
                 can_write = check_smb_folder_write(dir_unc, limiter, conn_timeout)
-                tracker.add_dir(dir_unc, accessible=True, write=can_write)
 
                 # Sensitive-name check drives the terminal badge/folder_hit
                 folder_name = dir_unc.rsplit("\\", 1)[-1] if "\\" in dir_unc else dir_unc
                 is_sens, reason = is_sensitive_folder(folder_name, _custom)
-                label = reason if is_sens else folder_name
-                rw    = f"READ=YES WRITE={'YES' if can_write else 'NO'}"
-                safe_print(Fore.MAGENTA + f"[FOLDER] {label}: {dir_unc} [{rw}]")
-                tracker.add_folder_hit(dir_unc, folder_name, label, True, can_write)
+
+                should_flag = is_sens or not flag_sensitive
+                if not flag_sensitive:
+                    tracker.add_dir(dir_unc, accessible=True, write=can_write)
+
+                if should_flag:
+                    label = reason if is_sens else folder_name
+                    rw    = f"READ=YES WRITE={'YES' if can_write else 'NO'}"
+                    safe_print(Fore.MAGENTA + f"[FOLDER] {label}: {dir_unc} [{rw}]")
+                    tracker.add_folder_hit(dir_unc, folder_name, label, True, can_write)
 
                 status_update(tracker, start_time)
+
+                # Respect depth limit - depth 0 is the root itself
+                if max_depth and depth >= max_depth:
+                    if debug:
+                        safe_print(Fore.YELLOW + f"[DEBUG] Depth limit ({max_depth}) reached at: {dir_unc}")
+                    continue
 
                 for ent in entries:
                     try:
@@ -1175,7 +1199,7 @@ def smb_walk_folders_threaded(root_unc: str,
                             continue
                     except Exception:
                         continue
-                    work_q.put(dir_unc + "\\" + ent.name)
+                    work_q.put((dir_unc + "\\" + ent.name, depth + 1))
             finally:
                 work_q.task_done()
 
@@ -1221,13 +1245,20 @@ def scan_smb_target(unc: str, args, tracker: FindingTracker, start_time: float):
         custom_folders = {n.lower() for n in (args.custom_folders or [])}
         folders_only = getattr(args, "folders_only", False)
 
+        max_depth      = getattr(args, "level", 0)
+        flag_sensitive = getattr(args, "flag_sensitive", False)
+
         if folders_only:
-            safe_print(Fore.CYAN + f"[i] {root_unc}: Folder-only mode — scanning with {args.threads} threads")
+            depth_note = f", depth limit: {max_depth}" if max_depth else ""
+            sens_note  = ", sensitive-only flagging" if flag_sensitive else ""
+            safe_print(Fore.CYAN + f"[i] {root_unc}: Folder-only mode - {args.threads} threads{depth_note}{sens_note}")
             smb_walk_folders_threaded(
                 root_unc, tracker, args.debug,
                 limiter, args.conn_timeout,
                 args.dfs_quarantine_maxfails, args.dfs_quarantine_secs,
                 start_time, custom_folders, args.threads,
+                max_depth=max_depth,
+                flag_sensitive=flag_sensitive,
             )
         else:
             candidates = list(smb_walk_files_with_dfs(
@@ -1237,6 +1268,7 @@ def scan_smb_target(unc: str, args, tracker: FindingTracker, start_time: float):
                 start_time,
                 sensitive_folders=custom_folders,
                 folders_only=False,
+                max_depth=max_depth,
             ))
             safe_print(Fore.GREEN + f"[i] {root_unc}: {len(candidates)} candidate files queued for scanning")
             status_update(tracker, start_time, force=True)
@@ -1674,6 +1706,14 @@ def build_arg_parser():
 
     p.add_argument("--FoldersOnly", "-Fo", dest="folders_only", action="store_true",
                    help="Only scan for sensitive folder names; skip file content scanning.")
+    p.add_argument("--FlagSensitive", "-Fs", dest="flag_sensitive", action="store_true",
+                   help="Only flag/report folders whose names match the sensitive list "
+                        "(Confidential, Secret, Internal, OneDrive, or -Cu names). "
+                        "All folders are still traversed; non-matching folders appear only "
+                        "in the All Directories table, not as flagged hits.")
+    p.add_argument("--level", type=int, default=0, metavar="N",
+                   help="Maximum folder depth to scan below the share root (0 = unlimited). "
+                        "E.g. --level 2 stops after two directory levels.")
     p.add_argument("--Custom", "-Cu", dest="custom_folders", nargs="+", default=[], metavar="NAME",
                    help="Additional folder names to flag (e.g. -Cu Test1 Test2). Case-insensitive.")
 

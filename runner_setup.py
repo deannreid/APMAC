@@ -258,8 +258,9 @@ def main():
 
     # ── Step 3: Scan options ──────────────────────────────────────────────────
     _h("Step 3 of 4  Scan Options")
-    folders_only   = _ask_yn("Folders-only mode (-Fo)?", default=False)
-    custom_folders = []
+    folders_only    = _ask_yn("Folders-only mode (-Fo)?", default=False)
+    flag_sensitive  = _ask_yn("Flag sensitive folders only (-Fs)?", default=False) if folders_only else False
+    custom_folders  = []
     if _ask_yn("Flag custom folder names (-Cu)?", default=False):
         custom_folders = _ask_list("Custom folder names", "Payroll Legal Contracts")
 
@@ -267,6 +268,7 @@ def main():
     dns        = _ask("DNS server for resolution fallback (optional)") or None
     dc         = _ask("Domain controller hostname (optional)")         or None
     threads    = int(_ask("Worker threads", default="20"))
+    level      = int(_ask("Max folder depth (0 = unlimited)", default="0"))
 
     # ── Step 4: Schedule ──────────────────────────────────────────────────────
     _h("Step 4 of 4  Monthly Schedule")
@@ -286,11 +288,13 @@ def main():
         "username":       username,
         "shares":         shares,
         "folders_only":   folders_only,
+        "flag_sensitive": flag_sensitive,
         "custom_folders": custom_folders,
         "report_dir":     report_dir,
         "dns":            dns,
         "dc":             dc,
         "threads":        threads,
+        "level":          level,
         "log_file":       str(HERE / "runner.log"),
     }
     CONFIG_PATH.write_text(json.dumps(config, indent=2), encoding="utf-8")
