@@ -12,6 +12,7 @@ import os
 import re
 import sys
 import csv
+import html
 import time
 import socket
 import signal
@@ -40,9 +41,14 @@ from smbprotocol.exceptions import (
 
 init(autoreset=True)
 
-GLOBAL_TRACKER = None
-GLOBAL_CSV_WRITER = None
-GLOBAL_START_TIME = None
+GLOBAL_TRACKER      = None
+GLOBAL_CSV_WRITER   = None
+GLOBAL_START_TIME   = None
+GLOBAL_OUT_DIR      = None
+GLOBAL_SCAN_TS      = None
+GLOBAL_TARGETS      = None
+GLOBAL_FOLDERS_ONLY = False
+GLOBAL_SCAN_USER    = None
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -971,14 +977,15 @@ def smb_walk_files_with_dfs(root_unc: str,
                 continue
 
         # ── Filename pattern check (all files, any extension) ──
-        for f in files:
-            file_unc = dir_unc + "\\" + f.name
-            for pat_name, pat_re in SENSITIVE_FILENAME_PATTERNS.items():
-                if pat_re.search(f.name):
-                    if check_smb_file_readable(file_unc, limiter, conn_timeout):
-                        safe_print(Fore.YELLOW + f"[FILENAME] {pat_name}: {file_unc}")
-                        tracker.add_filename_hit(file_unc, f.name, pat_name)
-                    break  # one label per file is enough
+        if not folders_only:
+            for f in files:
+                file_unc = dir_unc + "\\" + f.name
+                for pat_name, pat_re in SENSITIVE_FILENAME_PATTERNS.items():
+                    if pat_re.search(f.name):
+                        if check_smb_file_readable(file_unc, limiter, conn_timeout):
+                            safe_print(Fore.YELLOW + f"[FILENAME] {pat_name}: {file_unc}")
+                            tracker.add_filename_hit(file_unc, f.name, pat_name)
+                        break  # one label per file is enough
 
         if not folders_only:
             for f in files:
@@ -1016,15 +1023,46 @@ def smb_walk_files_with_dfs(root_unc: str,
 
 # ───────────── Clean shutdown (Ctrl+C flush) ─────────────
 def flush_and_exit(code: int = 0):
-    global GLOBAL_CSV_WRITER
+    global GLOBAL_CSV_WRITER, GLOBAL_TRACKER, GLOBAL_OUT_DIR, GLOBAL_SCAN_TS, GLOBAL_START_TIME, GLOBAL_TARGETS, GLOBAL_FOLDERS_ONLY, GLOBAL_SCAN_USER
     status_clear_hard()
-    try:
-        if GLOBAL_CSV_WRITER is not None:
-            safe_print(Fore.YELLOW + "\n[i] Interrupt received - closing CSV parts...")
+
+    # Flush and close CSV files so nothing is lost
+    if GLOBAL_CSV_WRITER is not None:
+        safe_print(Fore.YELLOW + "\n[i] Interrupt received  flushing CSV files...")
+        try:
             GLOBAL_CSV_WRITER.close()
             safe_print(Fore.GREEN + "[✓] CSV flushed and closed.")
-    except Exception as e:
-        safe_print(Fore.RED + f"[!] Failed to flush CSV on exit: {e}")
+        except Exception as exc:
+            safe_print(Fore.RED + f"[!] Failed to flush CSV on exit: {exc}")
+
+    # Generate filtered CSVs + HTML from whatever was collected in memory
+    if GLOBAL_TRACKER is not None and GLOBAL_OUT_DIR and GLOBAL_SCAN_TS:
+        elapsed      = (time.time() - GLOBAL_START_TIME) if GLOBAL_START_TIME else 0.0
+        _, total_s, total_h, pattern_counts, denied_n, total_r = GLOBAL_TRACKER.snapshot()
+        folder_hits   = GLOBAL_TRACKER.folder_hits
+        filename_hits = GLOBAL_TRACKER.filename_hits
+        targets       = GLOBAL_TARGETS or []
+        folders_only  = GLOBAL_FOLDERS_ONLY
+
+        try:
+            filtered = write_filtered_csvs(GLOBAL_OUT_DIR, folder_hits, GLOBAL_SCAN_TS)
+            for fp in filtered:
+                safe_print(Fore.GREEN + f"[✓] Filtered CSV:  {fp}")
+        except Exception as exc:
+            safe_print(Fore.RED + f"[!] Failed to write filtered CSVs: {exc}")
+
+        try:
+            html_path = generate_html_report(
+                GLOBAL_OUT_DIR, folder_hits, filename_hits,
+                pattern_counts, total_s, total_r,
+                denied_n, total_h, elapsed,
+                GLOBAL_SCAN_TS, targets, folders_only,
+                scan_user=GLOBAL_SCAN_USER or "<anonymous>",
+            )
+            safe_print(Fore.GREEN + f"[✓] HTML report (partial): {html_path}")
+        except Exception as exc:
+            safe_print(Fore.RED + f"[!] Failed to generate HTML report: {exc}")
+
     raise SystemExit(code)
 
 def signal_handler(sig, frame):
@@ -1108,6 +1146,313 @@ def scan_smb_target(unc: str, args, tracker: FindingTracker, start_time: float):
                             safe_print(traceback.format_exc())
                     status_update(tracker, start_time)
 
+# ───────────── HTML report assets (not f-strings – braces are literal) ─────────────
+_REPORT_CSS = """
+    :root {
+      --bg: #0d1117; --surface: #161b22; --border: #30363d;
+      --text: #c9d1d9; --muted: #8b949e; --accent: #58a6ff;
+      --green: #3fb950; --red: #f85149; --yellow: #d29922;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: var(--bg); color: var(--text); font-family: 'Courier New', Courier, monospace; font-size: 14px; line-height: 1.6; padding: 24px; }
+    h1 { color: var(--accent); font-size: 24px; margin-bottom: 4px; }
+    h2 { color: var(--accent); font-size: 18px; margin: 24px 0 12px; border-bottom: 1px solid var(--border); padding-bottom: 8px; }
+    .subtitle { color: var(--muted); font-size: 12px; margin-bottom: 24px; }
+    .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 8px; }
+    .stat-card { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 16px; }
+    .stat-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
+    .stat-value { font-size: 28px; font-weight: bold; color: var(--accent); margin: 4px 0; }
+    .stat-value.danger { color: var(--red); }
+    .stat-value.warn { color: var(--yellow); }
+    .stat-value.ok { color: var(--green); }
+    table { width: 100%; border-collapse: collapse; background: var(--surface); border-radius: 6px; overflow: hidden; border: 1px solid var(--border); }
+    thead th { background: #1c2128; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--border); }
+    tbody tr.folder-row { cursor: pointer; transition: background 0.15s; }
+    tbody tr.folder-row:hover { background: #1c2128; }
+    tbody td { padding: 10px 12px; border-bottom: 1px solid var(--border); vertical-align: top; font-size: 13px; }
+    .path-cell { word-break: break-all; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 11px; font-weight: bold; }
+    .badge-confidential { background: #3d1a1a; color: #f85149; border: 1px solid #6a2020; }
+    .badge-secret { background: #3a1a3d; color: #d2a8ff; border: 1px solid #5a2060; }
+    .badge-internal { background: #2a2a1a; color: #e3b341; border: 1px solid #4a3a1a; }
+    .badge-onedrive { background: #1a2a3a; color: #79c0ff; border: 1px solid #1a3a5a; }
+    .badge-custom { background: #1a2a3d; color: #58a6ff; border: 1px solid #1a3a5a; }
+    .access-yes { color: var(--red); font-weight: bold; }
+    .access-no { color: var(--muted); }
+    tr.acl-detail { display: none; }
+    tr.acl-detail td { background: #0a0e13; padding: 16px 24px; }
+    tr.acl-detail.open { display: table-row; }
+    .acl-table { width: auto; background: transparent; border: none; margin-top: 8px; }
+    .acl-table td { padding: 4px 16px 4px 0; border: none; font-size: 13px; color: var(--muted); }
+    .acl-table td:first-child { color: var(--text); font-weight: bold; min-width: 160px; }
+    .expand-icon { float: right; color: var(--muted); font-style: normal; font-size: 10px; }
+    .filter-bar { margin-bottom: 12px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .filter-bar input { background: var(--surface); border: 1px solid var(--border); color: var(--text); padding: 6px 10px; border-radius: 4px; font-family: inherit; font-size: 12px; width: 260px; }
+    .filter-bar input:focus { outline: none; border-color: var(--accent); }
+    .filter-btn { background: var(--surface); border: 1px solid var(--border); color: var(--muted); padding: 5px 12px; border-radius: 4px; cursor: pointer; font-size: 11px; font-family: inherit; }
+    .filter-btn:hover, .filter-btn.active { border-color: var(--accent); color: var(--accent); }
+    .no-data { color: var(--muted); padding: 24px; text-align: center; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; }
+    .account-block { background: #111820; border: 1px solid #1e3a5f; border-left: 3px solid var(--accent); border-radius: 6px; padding: 14px 18px; margin-bottom: 24px; }
+    .account-label { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 4px; }
+    .account-user  { color: var(--accent); font-size: 17px; font-weight: bold; margin-bottom: 6px; letter-spacing: 0.02em; }
+    .account-meta  { font-size: 13px; color: var(--text); margin-bottom: 6px; }
+    .account-note  { font-size: 11px; color: var(--muted); font-style: italic; }
+    footer { margin-top: 32px; color: var(--muted); font-size: 11px; border-top: 1px solid var(--border); padding-top: 12px; }
+    a { color: var(--accent); }
+"""
+
+_REPORT_JS = r"""
+    function toggleAcl(idx) {
+      var detail = document.getElementById('acl-' + idx);
+      var icon   = document.getElementById('row-' + idx).querySelector('.expand-icon');
+      if (detail.classList.contains('open')) {
+        detail.classList.remove('open');
+        icon.textContent = '▶';
+      } else {
+        detail.classList.add('open');
+        icon.textContent = '▼';
+      }
+    }
+    var filterInput  = document.getElementById('folder-filter');
+    var filterBtns   = document.querySelectorAll('.filter-btn[data-reason]');
+    var activeReason = '';
+    if (filterBtns.length) {
+      filterBtns.forEach(function(btn) {
+        btn.addEventListener('click', function() {
+          if (activeReason === btn.dataset.reason) {
+            activeReason = '';
+            filterBtns.forEach(function(b) { b.classList.remove('active'); });
+          } else {
+            activeReason = btn.dataset.reason;
+            filterBtns.forEach(function(b) { b.classList.remove('active'); });
+            btn.classList.add('active');
+          }
+          applyFilters();
+        });
+      });
+    }
+    if (filterInput) { filterInput.addEventListener('input', applyFilters); }
+    function applyFilters() {
+      var text = filterInput ? filterInput.value.toLowerCase() : '';
+      document.querySelectorAll('tr.folder-row').forEach(function(row) {
+        var match = (!text || row.dataset.path.toLowerCase().includes(text))
+                 && (!activeReason || row.dataset.reason === activeReason);
+        row.style.display = match ? '' : 'none';
+        if (!match) {
+          var d = document.getElementById(row.id.replace('row-', 'acl-'));
+          if (d) d.classList.remove('open');
+        }
+      });
+    }
+"""
+
+
+def _html_badge(reason: str) -> str:
+    r = reason.lower()
+    if r.startswith("custom:"):
+        css = "badge-custom"
+    elif r == "onedrive":
+        css = "badge-onedrive"
+    elif r == "confidential":
+        css = "badge-confidential"
+    elif r == "secret":
+        css = "badge-secret"
+    elif r == "internal":
+        css = "badge-internal"
+    else:
+        css = "badge-custom"
+    return f'<span class="badge {css}">{html.escape(reason)}</span>'
+
+
+def write_filtered_csvs(out_dir: str, folder_hits: list, scan_ts: str) -> list:
+    """Write per-category CSVs for Confidential and Secret folder hits."""
+    headers = ["timestamp_utc", "path", "folder_name", "reason", "read_access", "write_access"]
+    filters = {
+        "confidential": lambda h: h["reason"].lower() == "confidential",
+        "secret":       lambda h: h["reason"].lower() == "secret",
+    }
+    created = []
+    for label, predicate in filters.items():
+        hits = [h for h in folder_hits if predicate(h)]
+        if not hits:
+            continue
+        csv_path = os.path.join(out_dir, f"{label}_folders_{scan_ts}.csv")
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(headers)
+            for h in hits:
+                w.writerow([
+                    h["ts"], h["path"], h["name"], h["reason"],
+                    "YES" if h["read"] else "NO",
+                    "YES" if h["write"] else "NO",
+                ])
+        created.append(csv_path)
+    return created
+
+
+def generate_html_report(out_dir: str, folder_hits: list, filename_hits: list,
+                          pattern_counts: dict, total_s: int, total_r: int,
+                          denied_n: int, total_h: int, elapsed: float,
+                          scan_ts: str, targets: list, folders_only: bool,
+                          scan_user: str = "<anonymous>") -> str:
+    date_str    = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    targets_str = html.escape(", ".join(targets)) if targets else "N/A"
+    user_esc    = html.escape(scan_user or "<anonymous>")
+
+    def _fmt(secs: float) -> str:
+        s = int(secs); h = s // 3600; m = (s % 3600) // 60; sc = s % 60
+        return f"{h:02d}:{m:02d}:{sc:02d}" if h else f"{m:02d}:{sc:02d}"
+
+    # ── Folder rows ──
+    folder_rows_html = []
+    for idx, hit in enumerate(folder_hits):
+        p_esc  = html.escape(hit["path"])
+        r_esc  = html.escape(hit["reason"])
+        badge  = _html_badge(hit["reason"])
+        r_cls  = "access-yes" if hit["read"]  else "access-no"
+        w_cls  = "access-yes" if hit["write"] else "access-no"
+        r_lbl  = "YES" if hit["read"]  else "NO"
+        w_lbl  = "YES" if hit["write"] else "NO"
+        r_desc = "&#x2714; folder listing permitted"  if hit["read"]  else "&#x2718; access denied"
+        w_desc = "&#x2714; probe file create/delete succeeded" if hit["write"] else "&#x2718; write probe failed"
+        ts_esc = html.escape(hit["ts"])
+        folder_rows_html.append(f"""
+        <tr class="folder-row" id="row-{idx}" data-path="{p_esc}" data-reason="{r_esc}" onclick="toggleAcl({idx})">
+          <td class="path-cell">{p_esc} <i class="expand-icon">&#x25B6;</i></td>
+          <td>{badge}</td>
+          <td class="{r_cls}">{r_lbl}</td>
+          <td class="{w_cls}">{w_lbl}</td>
+          <td style="color:var(--muted);font-size:12px">{ts_esc}</td>
+        </tr>
+        <tr class="acl-detail" id="acl-{idx}">
+          <td colspan="5">
+            <strong style="color:var(--accent)">Access Probe Results</strong>
+            <table class="acl-table">
+              <tr><td>Path</td><td style="color:var(--text)">{p_esc}</td></tr>
+              <tr><td>Match Reason</td><td>{badge}</td></tr>
+              <tr><td>Tested As</td><td style="color:var(--accent)">{user_esc}</td></tr>
+              <tr><td>Read Access</td><td class="{r_cls}">{r_desc}</td></tr>
+              <tr><td>Write Access</td><td class="{w_cls}">{w_desc}</td></tr>
+              <tr><td>Detected At</td><td>{ts_esc}</td></tr>
+            </table>
+          </td>
+        </tr>""")
+
+    if folder_rows_html:
+        reasons      = sorted({h["reason"] for h in folder_hits})
+        filter_btns  = "".join(
+            f'<button class="filter-btn" data-reason="{html.escape(r)}">{html.escape(r)}</button>'
+            for r in reasons
+        )
+        folder_section = f"""
+  <div class="filter-bar">
+    <input id="folder-filter" type="text" placeholder="Filter by path...">
+    {filter_btns}
+  </div>
+  <table>
+    <thead><tr>
+      <th>Path</th><th>Reason</th><th>Read</th><th>Write</th><th>Detected At</th>
+    </tr></thead>
+    <tbody>{"".join(folder_rows_html)}</tbody>
+  </table>"""
+    else:
+        folder_section = '<p class="no-data">No sensitive folders detected.</p>'
+
+    # ── Filename hits section ──
+    fname_section = ""
+    if not folders_only and filename_hits:
+        fname_rows = "".join(
+            f'<tr><td class="path-cell">{html.escape(h["path"])}</td>'
+            f'<td><span class="badge badge-custom">{html.escape(h["pattern"])}</span></td>'
+            f'<td style="color:var(--muted);font-size:12px">{html.escape(h["ts"])}</td></tr>'
+            for h in filename_hits
+        )
+        fname_section = f"""
+  <h2>Sensitive Filenames <span style="color:var(--muted);font-size:14px;font-weight:normal">({len(filename_hits)} found)</span></h2>
+  <table>
+    <thead><tr><th>Path</th><th>Pattern</th><th>Detected At</th></tr></thead>
+    <tbody>{fname_rows}</tbody>
+  </table>"""
+
+    # ── Pattern breakdown section ──
+    patt_section = ""
+    if not folders_only and pattern_counts and any(v > 0 for v in pattern_counts.values()):
+        patt_rows = "".join(
+            f'<tr><td>{html.escape(k)}</td>'
+            f'<td style="color:var(--{"red" if v > 0 else "muted"})">{v}</td></tr>'
+            for k, v in sorted(pattern_counts.items(), key=lambda x: (-x[1], x[0]))
+        )
+        patt_section = f"""
+  <h2>Pattern Breakdown</h2>
+  <table style="width:auto">
+    <thead><tr><th>Pattern</th><th>Hits</th></tr></thead>
+    <tbody>{patt_rows}</tbody>
+  </table>"""
+
+    hit_class    = "danger" if total_h      else "ok"
+    folder_class = "danger" if folder_hits  else "ok"
+    fname_class  = "warn"   if filename_hits else "ok"
+
+    readable_count = sum(1 for h in folder_hits if h["read"])
+    writable_count = sum(1 for h in folder_hits if h["write"])
+    total_folders  = len(folder_hits)
+    rw_class = "danger" if writable_count else "ok"
+
+    report = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>APMAC Audit Report &#8211; {html.escape(scan_ts)}</title>
+  <style>{_REPORT_CSS}</style>
+</head>
+<body>
+  <h1>&#x1F50D; APMAC Audit Report</h1>
+  <div class="subtitle">
+    Generated: {date_str} &nbsp;&bull;&nbsp; Target(s): {targets_str} &nbsp;&bull;&nbsp; Elapsed: {_fmt(elapsed)}
+  </div>
+
+  <div class="account-block">
+    <div class="account-label">Scanning Account</div>
+    <div class="account-user">{user_esc}</div>
+    <div class="account-meta">
+      <span>Folders readable:&nbsp;<strong style="color:var(--red)">{readable_count}</strong> / {total_folders}</span>
+      <span style="margin-left:24px">Folders writable:&nbsp;<strong class="{rw_class}">{writable_count}</strong> / {total_folders}</span>
+    </div>
+    <div class="account-note">All access probe results in this report reflect the permissions held by the account above.</div>
+  </div>
+
+  <h2>Summary</h2>
+  <div class="stats-grid">
+    <div class="stat-card"><div class="stat-label">Files Scanned</div><div class="stat-value">{total_s:,}</div></div>
+    <div class="stat-card"><div class="stat-label">Files Readable</div><div class="stat-value ok">{total_r:,}</div></div>
+    <div class="stat-card"><div class="stat-label">Files Denied</div><div class="stat-value warn">{denied_n:,}</div></div>
+    <div class="stat-card"><div class="stat-label">Content Hits</div><div class="stat-value {hit_class}">{total_h:,}</div></div>
+    <div class="stat-card"><div class="stat-label">Sensitive Folders</div><div class="stat-value {folder_class}">{len(folder_hits):,}</div></div>
+    <div class="stat-card"><div class="stat-label">Filename Hits</div><div class="stat-value {fname_class}">{len(filename_hits):,}</div></div>
+  </div>
+
+  {patt_section}
+
+  <h2>Sensitive Folders <span style="color:var(--muted);font-size:14px;font-weight:normal">({len(folder_hits)} found &#8212; click row for ACL details)</span></h2>
+  {folder_section}
+
+  {fname_section}
+
+  <footer>
+    APMAC v3 &mdash; Automated Privileged Material Acquisition Console &mdash;
+    <a href="https://github.com/deannreid/APMAC">github.com/deannreid/APMAC</a>
+  </footer>
+  <script>{_REPORT_JS}</script>
+</body>
+</html>"""
+
+    out_path = os.path.join(out_dir, f"APMAC_Report_{scan_ts}.html")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(report)
+    return out_path
+
+
 # ───────────── Args ─────────────
 def build_arg_parser():
     p = argparse.ArgumentParser(
@@ -1144,15 +1489,20 @@ def build_arg_parser():
     p.add_argument("--Custom", "-Cu", dest="custom_folders", nargs="+", default=[], metavar="NAME",
                    help="Additional folder names to flag (e.g. -Cu Test1 Test2). Case-insensitive.")
 
-    default_csv = f"apmac_findings_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%SZ')}.csv"
-    p.add_argument("--out-csv", default=default_csv, help="CSV base path (auto-splits into _partXXX.csv).")
+    p.add_argument("--out-dir", default=None, metavar="PATH",
+                   help="Output directory for the HTML report and all CSVs. "
+                        "Default: ./APMAC_Audit-TIMESTAMP in the current directory. "
+                        "Can be a local path or a UNC network share (e.g. \\\\server\\share\\reports).")
+    p.add_argument("--out-csv", default="apmac_findings.csv",
+                   help="CSV filename placed inside --out-dir (auto-splits into _partXXX.csv).")
     p.add_argument("--csv-max-rows", type=int, default=5000, help="Max rows per CSV part before rotating.")
     return p
 
 def main():
-    global GLOBAL_TRACKER, GLOBAL_CSV_WRITER, GLOBAL_START_TIME
+    global GLOBAL_TRACKER, GLOBAL_CSV_WRITER, GLOBAL_START_TIME, GLOBAL_OUT_DIR, GLOBAL_SCAN_TS, GLOBAL_TARGETS, GLOBAL_FOLDERS_ONLY, GLOBAL_SCAN_USER
 
     args = build_arg_parser().parse_args()
+    scan_ts = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%SZ')
 
     if args.user and args.password is None:
         args.password = getpass.getpass("SMB Password: ")
@@ -1164,7 +1514,19 @@ def main():
         safe_print(Fore.RED + "[!] Provide at least one --share target.")
         raise SystemExit(1)
 
-    csv_writer = ChunkedCSVWriter(args.out_csv, max_rows=args.csv_max_rows)
+    out_dir = args.out_dir if args.out_dir else os.path.join(os.getcwd(), f"APMAC_Audit-{scan_ts}")
+    os.makedirs(out_dir, exist_ok=True)
+    safe_print(Fore.GREEN + f"[i] Output directory: {out_dir}")
+
+    GLOBAL_OUT_DIR      = out_dir
+    GLOBAL_SCAN_TS      = scan_ts
+    GLOBAL_TARGETS      = list(args.share)
+    GLOBAL_FOLDERS_ONLY = getattr(args, "folders_only", False)
+    GLOBAL_SCAN_USER    = fmt_user(args.domain, args.user)
+
+    csv_name = os.path.basename(args.out_csv) or "apmac_findings.csv"
+    csv_path = os.path.join(out_dir, csv_name)
+    csv_writer = ChunkedCSVWriter(csv_path, max_rows=args.csv_max_rows)
     GLOBAL_CSV_WRITER = csv_writer
 
     tracker = FindingTracker(pattern_names=list(patterns.keys()), debug=args.debug, csv_writer=csv_writer)
@@ -1277,10 +1639,27 @@ def main():
     box_bot()
     safe_print("")
 
-    root, ext = os.path.splitext(args.out_csv)
-    if not ext:
-        ext = ".csv"
-    safe_print(Fore.YELLOW + f"[✓] CSV exported (chunked): {root}_partXXX{ext}")
+    # Generate filtered CSVs (Confidential + Secret folders)
+    filtered = write_filtered_csvs(out_dir, folder_hits, scan_ts)
+    for fp in filtered:
+        safe_print(Fore.GREEN + f"[✓] Filtered CSV:  {fp}")
+
+    # Generate HTML report
+    folders_only = getattr(args, "folders_only", False)
+    html_path = generate_html_report(
+        out_dir, folder_hits, filename_hits,
+        pattern_counts, total_s, total_r,
+        denied_n, total_h, elapsed,
+        scan_ts, args.share, folders_only,
+        scan_user=fmt_user(args.domain, args.user),
+    )
+    safe_print(Fore.GREEN + f"[✓] HTML report:   {html_path}")
+
+    csv_root, csv_ext = os.path.splitext(csv_path)
+    if not csv_ext:
+        csv_ext = ".csv"
+    safe_print(Fore.YELLOW + f"[✓] Output dir:    {out_dir}")
+    safe_print(Fore.YELLOW + f"[✓] CSV exported:  {csv_root}_partXXX{csv_ext}")
 
 if __name__ == "__main__":
     main()
