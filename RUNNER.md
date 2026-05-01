@@ -18,12 +18,65 @@ Two scripts - run `runner_setup.py` once to configure, then `runner.py` is calle
 
 ---
 
-## Prerequisites
+## Installation
 
-- Python 3.10+
-- All APMAC dependencies installed (`pip install -r requirements.txt`)
-- On Linux: `cryptography` package (already required by APMAC via `smbprotocol`)
-- On Windows: run `runner_setup.py` as **Administrator** to register the Task Scheduler job and apply ACL hardening
+### Python packages
+
+Install all dependencies in one step from the repo root:
+
+```bash
+pip install -r requirements.txt
+```
+
+Or individually:
+
+```bash
+pip install smbprotocol colorama cryptography
+```
+
+`smbprotocol` is the SMB client library. Installing it also installs the `smbclient` Python module that APMAC imports directly. `cryptography` is a transitive dependency of `smbprotocol` and is also used by the Linux runner for credential encryption.
+
+### Linux — `smbclient` CLI tool
+
+APMAC uses the `smbclient` command-line tool (separate from the Python package) when enumerating shares from a bare `\\server` target with no share name specified. Install it for your distribution:
+
+```bash
+# Debian / Ubuntu
+sudo apt install smbclient
+
+# RHEL / CentOS / Rocky / AlmaLinux
+sudo yum install samba-client
+
+# Fedora
+sudo dnf install samba-client
+
+# Arch
+sudo pacman -S smbclient
+```
+
+If `smbclient` is not installed, share enumeration from bare server paths will fail with a clear error. Scanning a specific share directly (e.g. `--share \\server\sharename`) does not require it.
+
+### Windows
+
+No `smbclient` CLI install is needed on Windows. The Python `smbprotocol` package handles all SMB communication natively. Run `pip install -r requirements.txt` in a standard command prompt or PowerShell window.
+
+### Python version
+
+Python 3.10 or newer is required (uses `match`-compatible type hints and union syntax). Verify with:
+
+```bash
+python --version
+# or
+python3 --version
+```
+
+### Windows — Task Scheduler and ACL hardening
+
+`runner_setup.py` must be run as **Administrator** to register the Task Scheduler job and apply `icacls` ACL restrictions to `runner.cred`. Right-click the terminal and choose *Run as administrator*, or:
+
+```powershell
+Start-Process python -ArgumentList "runner_setup.py" -Verb RunAs
+```
 
 ---
 

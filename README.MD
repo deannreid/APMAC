@@ -37,14 +37,30 @@ Built for large enterprise shares where DFS and permissions are messy.
 
 ## 📦 Installation
 
-```bash id="tsw2s1"
-pip install smbprotocol smbclient colorama
+```bash
+pip install -r requirements.txt
 ```
 
-Optional (for share enumeration):
+Or individually:
 
-```bash id="6p9q9o"
+```bash
+pip install smbprotocol colorama cryptography
+```
+
+**Linux — `smbclient` CLI** (optional, needed only for bare `\\server` share enumeration):
+
+```bash
+# Debian / Ubuntu
 sudo apt install smbclient
+
+# RHEL / CentOS / Rocky / AlmaLinux
+sudo yum install samba-client
+
+# Fedora
+sudo dnf install samba-client
+
+# Arch
+sudo pacman -S smbclient
 ```
 
 ---

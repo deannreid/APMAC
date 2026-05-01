@@ -14,6 +14,7 @@ import sys
 import csv
 import html
 import time
+import queue
 import socket
 import signal
 import random
@@ -38,6 +39,10 @@ from smbprotocol.exceptions import (
     PathNotCovered,
     NotFound,
 )
+try:
+    from smbprotocol.exceptions import SMBOSError as _SMBOSError
+except ImportError:
+    _SMBOSError = None
 
 init(autoreset=True)
 
@@ -170,7 +175,7 @@ SENSITIVE_FILENAME_PATTERNS: dict[str, re.Pattern] = {
     "DatabaseDump": re.compile(r'\bdump\b|\.sql$', re.I),
 }
 
-EXCLUDED_DIRS = {'node_modules', '.git', '__pycache__', 'vendor', 'venv'}
+EXCLUDED_DIRS = {'node_modules', '.git', '__pycache__', 'vendor', 'venv', '.dfsfolderlink'}
 
 # ───────────── Sensitive folder names ─────────────
 DEFAULT_SENSITIVE_FOLDERS = {"confidential", "internal", "secret"}
@@ -280,6 +285,17 @@ def is_credit_error(exc: Exception) -> bool:
     s = str(exc).lower()
     return "credits" in s and ("only 0" in s or "0 credits" in s)
 
+def is_dfs_object_error(exc: Exception) -> bool:
+    if _SMBOSError is not None and isinstance(exc, _SMBOSError):
+        return True
+    s = str(exc)
+    return any(tag in s for tag in (
+        "STATUS_NOT_A_REPARSE_POINT",
+        "STATUS_IO_REPARSE_TAG_MISMATCH",
+        "STATUS_REPARSE_POINT_NOT_RESOLVED",
+        "SMBOSError",
+    ))
+
 # ───────────── Status bar (SSH-safe) ─────────────
 STATUS_LOCK = threading.Lock()
 LAST_STATUS_TS = 0.0
@@ -303,26 +319,40 @@ def progress_bar(done: int, total: int, width: int = 24) -> str:
     return "█" * filled + "░" * (width - filled)
 
 def status_render(tracker, start_time: float) -> str:
-    total_q, total_s, total_h, _, denied_n, _readable = tracker.snapshot()
+    total_q, total_s, total_h, _, denied_n, _readable, total_fh = tracker.snapshot()
     now = time.time()
     elapsed = now - start_time
-    rate = (total_s / elapsed) if elapsed > 0 else 0.0
-    remaining = max(0, total_q - total_s)
-    eta = (remaining / rate) if rate > 0 else 0.0
-    pct = (100.0 * total_s / max(1, total_q))
-    bar = progress_bar(total_s, total_q, width=26)
 
-    line = (
-        f"{Fore.GREEN}[PROGRESS]{Fore.RESET} "
-        f"{Fore.CYAN}{total_s}{Fore.RESET}/{Fore.CYAN}{total_q}{Fore.RESET} "
-        f"{Fore.YELLOW}{bar}{Fore.RESET} "
-        f"{Fore.MAGENTA}{pct:5.1f}%{Fore.RESET} "
-        f"Rate:{Fore.CYAN}{rate:5.1f}/s{Fore.RESET} "
-        f"ETA:{Fore.CYAN}{fmt_hms(eta)}{Fore.RESET} "
-        f"Hits:{Fore.CYAN}{total_h}{Fore.RESET} "
-        f"Denied:{Fore.RED}{denied_n}{Fore.RESET} "
-        f"Elapsed:{Fore.CYAN}{fmt_hms(elapsed)}{Fore.RESET}"
-    )
+    folders_only_mode = GLOBAL_FOLDERS_ONLY and total_q == 0
+
+    if folders_only_mode:
+        # No file queue in -Fo mode — show folder-centric bar
+        line = (
+            f"{Fore.GREEN}[SCAN]{Fore.RESET} "
+            f"Folders:{Fore.MAGENTA}{total_fh}{Fore.RESET} "
+            f"Hits:{Fore.CYAN}{total_h}{Fore.RESET} "
+            f"Denied:{Fore.RED}{denied_n}{Fore.RESET} "
+            f"Elapsed:{Fore.CYAN}{fmt_hms(elapsed)}{Fore.RESET}"
+        )
+    else:
+        rate = (total_s / elapsed) if elapsed > 0 else 0.0
+        remaining = max(0, total_q - total_s)
+        eta = (remaining / rate) if rate > 0 else 0.0
+        pct = (100.0 * total_s / max(1, total_q))
+        bar = progress_bar(total_s, total_q, width=26)
+        folder_part = f"Folders:{Fore.MAGENTA}{total_fh}{Fore.RESET} " if total_fh else ""
+        line = (
+            f"{Fore.GREEN}[PROGRESS]{Fore.RESET} "
+            f"{Fore.CYAN}{total_s}{Fore.RESET}/{Fore.CYAN}{total_q}{Fore.RESET} "
+            f"{Fore.YELLOW}{bar}{Fore.RESET} "
+            f"{Fore.MAGENTA}{pct:5.1f}%{Fore.RESET} "
+            f"Rate:{Fore.CYAN}{rate:5.1f}/s{Fore.RESET} "
+            f"ETA:{Fore.CYAN}{fmt_hms(eta)}{Fore.RESET} "
+            f"Hits:{Fore.CYAN}{total_h}{Fore.RESET} "
+            f"{folder_part}"
+            f"Denied:{Fore.RED}{denied_n}{Fore.RESET} "
+            f"Elapsed:{Fore.CYAN}{fmt_hms(elapsed)}{Fore.RESET}"
+        )
 
     try:
         cols = os.get_terminal_size(sys.stderr.fileno()).columns
@@ -503,8 +533,12 @@ class FindingTracker:
         self.total_files_readable = 0
         self.total_hits = 0
         self.denied_count = 0
+        self.total_folder_hits = 0
         self.folder_hits: list[dict] = []
         self.filename_hits: list[dict] = []
+        self.all_dirs: list[dict] = []
+        self._all_dirs_total = 0
+        self._ALL_DIRS_CAP   = 50_000
 
     def inc_queued(self, n=1):
         with self.lock:
@@ -548,7 +582,14 @@ class FindingTracker:
         }
         with self.lock:
             self.folder_hits.append(entry)
+            self.total_folder_hits += 1
         self.csv_writer.write_folder_hit(ts, folder_unc, match_reason, folder_name, can_read, can_write)
+
+    def add_dir(self, path: str, accessible: bool):
+        with self.lock:
+            self._all_dirs_total += 1
+            if len(self.all_dirs) < self._ALL_DIRS_CAP:
+                self.all_dirs.append({"path": path, "accessible": accessible})
 
     def add_denied(self, path: str, action: str, exc: Exception):
         ts = utc_now_iso()
@@ -567,6 +608,7 @@ class FindingTracker:
                 dict(self.counts),
                 self.denied_count,
                 self.total_files_readable,
+                self.total_folder_hits,
             )
 
 # ───────────── DNS fallback and hosts update ─────────────
@@ -697,6 +739,8 @@ def smbclient_list_shares(server: str, domain: str | None, username: str | None,
             continue
         if share_name.upper() in {"IPC$", "PRINT$", "ADMIN$"}:
             continue
+        if share_name.startswith("."):
+            continue
         shares.append(share_name)
 
     return shares
@@ -764,12 +808,10 @@ def check_smb_folder_read(folder_unc: str, limiter: CreditLimiter, conn_timeout:
     """Returns True if the current user can list the folder."""
     limiter.acquire(folder_unc)
     try:
-        list(smbclient.scandir(folder_unc, connection_timeout=conn_timeout))
+        for _ in smbclient.scandir(folder_unc, connection_timeout=conn_timeout):
+            break  # one SMB query is enough to prove read access
         return True
-    except Exception as e:
-        if is_access_denied(e):
-            return False
-        # Other errors (DFS/network) - treat as inaccessible
+    except Exception:
         return False
     finally:
         limiter.release(folder_unc)
@@ -834,6 +876,11 @@ def smb_scandir_with_retry(path_unc: str,
             if is_access_denied(e):
                 describe_smb_error(path_unc, e, debug)
                 tracker.add_denied(path_unc, "LISTDIR", e)
+                return None
+
+            if is_dfs_object_error(e):
+                if debug:
+                    safe_print(Fore.YELLOW + f"[DEBUG] DFS reparse/object skip: {path_unc}")
                 return None
 
             if (is_dfs_failover_candidate(e) or is_credit_error(e)) and attempt < retries:
@@ -904,6 +951,11 @@ def scan_smb_file_unc(file_unc: str,
                 tracker.add_denied(file_unc, "READ", e)
                 return
 
+            if is_dfs_object_error(e):
+                if debug:
+                    safe_print(Fore.YELLOW + f"[DEBUG] DFS reparse/object skip: {file_unc}")
+                return
+
             if (is_dfs_failover_candidate(e) or is_credit_error(e)) and attempt < retries:
                 quarantined = dfs_record_fail(file_unc, dfs_quarantine_secs, dfs_quarantine_maxfails) if is_dfs_failover_candidate(e) else False
                 if quarantined:
@@ -956,8 +1008,10 @@ def smb_walk_files_with_dfs(root_unc: str,
             retries=3
         )
         if entries is None:
+            tracker.add_dir(dir_unc, accessible=False)
             return
 
+        tracker.add_dir(dir_unc, accessible=True)
         segs = update_last_count(segs, len(entries))
         print_scan_line(segs)
 
@@ -971,7 +1025,7 @@ def smb_walk_files_with_dfs(root_unc: str,
                     if name.lower() in EXCLUDED_DIRS:
                         continue
                     dirs.append(ent)
-                elif ent.is_file():
+                elif not folders_only and ent.is_file():
                     files.append(ent)
             except Exception:
                 continue
@@ -1038,7 +1092,7 @@ def flush_and_exit(code: int = 0):
     # Generate filtered CSVs + HTML from whatever was collected in memory
     if GLOBAL_TRACKER is not None and GLOBAL_OUT_DIR and GLOBAL_SCAN_TS:
         elapsed      = (time.time() - GLOBAL_START_TIME) if GLOBAL_START_TIME else 0.0
-        _, total_s, total_h, pattern_counts, denied_n, total_r = GLOBAL_TRACKER.snapshot()
+        _, total_s, total_h, pattern_counts, denied_n, total_r, _ = GLOBAL_TRACKER.snapshot()
         folder_hits   = GLOBAL_TRACKER.folder_hits
         filename_hits = GLOBAL_TRACKER.filename_hits
         targets       = GLOBAL_TARGETS or []
@@ -1058,6 +1112,8 @@ def flush_and_exit(code: int = 0):
                 denied_n, total_h, elapsed,
                 GLOBAL_SCAN_TS, targets, folders_only,
                 scan_user=GLOBAL_SCAN_USER or "<anonymous>",
+                all_dirs=GLOBAL_TRACKER.all_dirs,
+                all_dirs_total=GLOBAL_TRACKER._all_dirs_total,
             )
             safe_print(Fore.GREEN + f"[✓] HTML report (partial): {html_path}")
         except Exception as exc:
@@ -1070,6 +1126,64 @@ def signal_handler(sig, frame):
     flush_and_exit(0)
 
 signal.signal(signal.SIGINT, signal_handler)
+
+# ───────────── Folder-only threaded BFS walker ─────────────
+def smb_walk_folders_threaded(root_unc: str,
+                               tracker: FindingTracker,
+                               debug: bool,
+                               limiter: CreditLimiter,
+                               conn_timeout: int,
+                               dfs_qmax: int,
+                               dfs_qsecs: int,
+                               start_time: float,
+                               sensitive_folders: set,
+                               max_workers: int):
+    """BFS directory walk using a thread pool. Only probes folder ACLs — no file work."""
+    _custom = sensitive_folders or set()
+    work_q  = queue.Queue()
+    work_q.put(root_unc)
+
+    def process_dir():
+        while True:
+            dir_unc = work_q.get()
+            try:
+                entries = smb_scandir_with_retry(
+                    dir_unc, debug, tracker, limiter, conn_timeout, dfs_qmax, dfs_qsecs)
+                if entries is None:
+                    tracker.add_dir(dir_unc, accessible=False)
+                    continue
+
+                tracker.add_dir(dir_unc, accessible=True)
+                status_update(tracker, start_time)
+
+                for ent in entries:
+                    try:
+                        if not ent.is_dir():
+                            continue
+                        if ent.name.lower() in EXCLUDED_DIRS:
+                            continue
+                    except Exception:
+                        continue
+
+                    next_unc  = dir_unc + "\\" + ent.name
+                    is_sens, reason = is_sensitive_folder(ent.name, _custom)
+                    if is_sens:
+                        can_read  = check_smb_folder_read(next_unc, limiter, conn_timeout)
+                        can_write = check_smb_folder_write(next_unc, limiter, conn_timeout)
+                        if can_read or can_write:
+                            rw = f"READ={'YES' if can_read else 'NO'} WRITE={'YES' if can_write else 'NO'}"
+                            safe_print(Fore.MAGENTA + f"[FOLDER] {reason}: {next_unc} [{rw}]")
+                            tracker.add_folder_hit(next_unc, ent.name, reason, can_read, can_write)
+
+                    work_q.put(next_unc)
+            finally:
+                work_q.task_done()
+
+    workers = [threading.Thread(target=process_dir, daemon=True) for _ in range(max_workers)]
+    for w in workers:
+        w.start()
+    work_q.join()
+
 
 # ───────────── Main SMB/DFS scan logic ─────────────
 def scan_smb_target(unc: str, args, tracker: FindingTracker, start_time: float):
@@ -1107,20 +1221,23 @@ def scan_smb_target(unc: str, args, tracker: FindingTracker, start_time: float):
         custom_folders = {n.lower() for n in (args.custom_folders or [])}
         folders_only = getattr(args, "folders_only", False)
 
-        # NOTE: This builds the candidate list (may be large). If you later want true streaming workers,
-        # we can switch to a producer/consumer queue.
-        candidates = list(smb_walk_files_with_dfs(
-            root_unc, tracker, args.debug, args.max_size,
-            limiter, args.conn_timeout,
-            args.dfs_quarantine_maxfails, args.dfs_quarantine_secs,
-            start_time,
-            sensitive_folders=custom_folders,
-            folders_only=folders_only,
-        ))
-
         if folders_only:
-            safe_print(Fore.CYAN + f"[i] {root_unc}: --FoldersOnly mode, skipping file content scan.")
+            safe_print(Fore.CYAN + f"[i] {root_unc}: Folder-only mode — scanning with {args.threads} threads")
+            smb_walk_folders_threaded(
+                root_unc, tracker, args.debug,
+                limiter, args.conn_timeout,
+                args.dfs_quarantine_maxfails, args.dfs_quarantine_secs,
+                start_time, custom_folders, args.threads,
+            )
         else:
+            candidates = list(smb_walk_files_with_dfs(
+                root_unc, tracker, args.debug, args.max_size,
+                limiter, args.conn_timeout,
+                args.dfs_quarantine_maxfails, args.dfs_quarantine_secs,
+                start_time,
+                sensitive_folders=custom_folders,
+                folders_only=False,
+            ))
             safe_print(Fore.GREEN + f"[i] {root_unc}: {len(candidates)} candidate files queued for scanning")
             status_update(tracker, start_time, force=True)
 
@@ -1244,6 +1361,15 @@ _REPORT_JS = r"""
         }
       });
     }
+    var allDirFilter = document.getElementById('alldir-filter');
+    if (allDirFilter) {
+      allDirFilter.addEventListener('input', function() {
+        var text = allDirFilter.value.toLowerCase();
+        document.querySelectorAll('tr.alldir-row').forEach(function(row) {
+          row.style.display = (!text || row.dataset.path.toLowerCase().includes(text)) ? '' : 'none';
+        });
+      });
+    }
 """
 
 
@@ -1294,7 +1420,9 @@ def generate_html_report(out_dir: str, folder_hits: list, filename_hits: list,
                           pattern_counts: dict, total_s: int, total_r: int,
                           denied_n: int, total_h: int, elapsed: float,
                           scan_ts: str, targets: list, folders_only: bool,
-                          scan_user: str = "<anonymous>") -> str:
+                          scan_user: str = "<anonymous>",
+                          all_dirs: list | None = None,
+                          all_dirs_total: int = 0) -> str:
     date_str    = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     targets_str = html.escape(", ".join(targets)) if targets else "N/A"
     user_esc    = html.escape(scan_user or "<anonymous>")
@@ -1389,6 +1517,59 @@ def generate_html_report(out_dir: str, folder_hits: list, filename_hits: list,
     <tbody>{patt_rows}</tbody>
   </table>"""
 
+    # ── All Directories section ──
+    all_dirs_section = ""
+    if all_dirs:
+        sensitive_lookup = {h["path"]: h for h in folder_hits}
+        actual_total = all_dirs_total if all_dirs_total > 0 else len(all_dirs)
+        truncated_note = (
+            f'<p style="color:var(--muted);font-size:12px">'
+            f'Showing first {len(all_dirs):,} of {actual_total:,} discovered directories.</p>'
+        ) if actual_total > len(all_dirs) else ""
+
+        all_dir_rows = []
+        for d in all_dirs:
+            p     = d["path"]
+            p_esc = html.escape(p)
+            acc   = d["accessible"]
+            st_cls = "access-yes" if acc else "access-no"
+            st_lbl = "&#x2714; Accessible" if acc else "&#x2718; Denied"
+
+            if p in sensitive_lookup:
+                hit   = sensitive_lookup[p]
+                badge = _html_badge(hit["reason"])
+                r_cls = "access-yes" if hit["read"]  else "access-no"
+                w_cls = "access-yes" if hit["write"] else "access-no"
+                r_lbl = "YES" if hit["read"]  else "NO"
+                w_lbl = "YES" if hit["write"] else "NO"
+            else:
+                badge = "&#x2014;"
+                r_cls = st_cls
+                r_lbl = "YES" if acc else "NO"
+                w_cls = ""
+                w_lbl = "&#x2014;"
+
+            all_dir_rows.append(
+                f'<tr class="alldir-row" data-path="{p_esc}">'
+                f'<td class="path-cell">{p_esc}</td>'
+                f'<td class="{st_cls}">{st_lbl}</td>'
+                f'<td>{badge}</td>'
+                f'<td class="{r_cls}">{r_lbl}</td>'
+                f'<td class="{w_cls}">{w_lbl}</td>'
+                f'</tr>'
+            )
+
+        all_dirs_section = f"""
+  <h2>All Directories <span style="color:var(--muted);font-size:14px;font-weight:normal">({actual_total:,} discovered)</span></h2>
+  {truncated_note}
+  <div class="filter-bar">
+    <input id="alldir-filter" type="text" placeholder="Filter by path...">
+  </div>
+  <table>
+    <thead><tr><th>Path</th><th>Status</th><th>Sensitive</th><th>Read</th><th>Write</th></tr></thead>
+    <tbody>{"".join(all_dir_rows)}</tbody>
+  </table>"""
+
     hit_class    = "danger" if total_h      else "ok"
     folder_class = "danger" if folder_hits  else "ok"
     fname_class  = "warn"   if filename_hits else "ok"
@@ -1436,6 +1617,8 @@ def generate_html_report(out_dir: str, folder_hits: list, filename_hits: list,
 
   <h2>Sensitive Folders <span style="color:var(--muted);font-size:14px;font-weight:normal">({len(folder_hits)} found &#8212; click row for ACL details)</span></h2>
   {folder_section}
+
+  {all_dirs_section}
 
   {fname_section}
 
@@ -1548,7 +1731,7 @@ def main():
     csv_writer.close()
 
     elapsed = time.time() - start_time
-    _, total_s, total_h, pattern_counts, denied_n, total_r = tracker.snapshot()
+    _, total_s, total_h, pattern_counts, denied_n, total_r, _ = tracker.snapshot()
     folder_hits  = tracker.folder_hits
     filename_hits = tracker.filename_hits
 
@@ -1652,6 +1835,8 @@ def main():
         denied_n, total_h, elapsed,
         scan_ts, args.share, folders_only,
         scan_user=fmt_user(args.domain, args.user),
+        all_dirs=tracker.all_dirs,
+        all_dirs_total=tracker._all_dirs_total,
     )
     safe_print(Fore.GREEN + f"[✓] HTML report:   {html_path}")
 
