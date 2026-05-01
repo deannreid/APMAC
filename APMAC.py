@@ -1467,7 +1467,11 @@ def generate_html_report(out_dir: str, folder_hits: list, filename_hits: list,
         </tr>""")
 
     if folder_rows_html:
-        reasons      = sorted({h["reason"] for h in folder_hits})
+        FIXED_SENSITIVE = {"Confidential", "Secret", "Internal", "OneDrive"}
+        reasons = sorted(
+            r for r in {h["reason"] for h in folder_hits}
+            if r in FIXED_SENSITIVE or r.lower().startswith("custom:")
+        )
         filter_btns  = "".join(
             f'<button class="filter-btn" data-reason="{html.escape(r)}">{html.escape(r)}</button>'
             for r in reasons
