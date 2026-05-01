@@ -585,11 +585,11 @@ class FindingTracker:
             self.total_folder_hits += 1
         self.csv_writer.write_folder_hit(ts, folder_unc, match_reason, folder_name, can_read, can_write)
 
-    def add_dir(self, path: str, accessible: bool):
+    def add_dir(self, path: str, accessible: bool, write: bool | None = None):
         with self.lock:
             self._all_dirs_total += 1
             if len(self.all_dirs) < self._ALL_DIRS_CAP:
-                self.all_dirs.append({"path": path, "accessible": accessible})
+                self.all_dirs.append({"path": path, "accessible": accessible, "write": write})
 
     def add_denied(self, path: str, action: str, exc: Exception):
         ts = utc_now_iso()
@@ -1150,10 +1150,21 @@ def smb_walk_folders_threaded(root_unc: str,
                 entries = smb_scandir_with_retry(
                     dir_unc, debug, tracker, limiter, conn_timeout, dfs_qmax, dfs_qsecs)
                 if entries is None:
-                    tracker.add_dir(dir_unc, accessible=False)
+                    tracker.add_dir(dir_unc, accessible=False, write=False)
                     continue
 
-                tracker.add_dir(dir_unc, accessible=True)
+                # Confirmed readable — probe write access for this directory
+                can_write = check_smb_folder_write(dir_unc, limiter, conn_timeout)
+                tracker.add_dir(dir_unc, accessible=True, write=can_write)
+
+                # Sensitive-name check drives the terminal badge/folder_hit
+                folder_name = dir_unc.rsplit("\\", 1)[-1] if "\\" in dir_unc else dir_unc
+                is_sens, reason = is_sensitive_folder(folder_name, _custom)
+                label = reason if is_sens else folder_name
+                rw    = f"READ=YES WRITE={'YES' if can_write else 'NO'}"
+                safe_print(Fore.MAGENTA + f"[FOLDER] {label}: {dir_unc} [{rw}]")
+                tracker.add_folder_hit(dir_unc, folder_name, label, True, can_write)
+
                 status_update(tracker, start_time)
 
                 for ent in entries:
@@ -1164,18 +1175,7 @@ def smb_walk_folders_threaded(root_unc: str,
                             continue
                     except Exception:
                         continue
-
-                    next_unc  = dir_unc + "\\" + ent.name
-                    is_sens, reason = is_sensitive_folder(ent.name, _custom)
-                    if is_sens:
-                        can_read  = check_smb_folder_read(next_unc, limiter, conn_timeout)
-                        can_write = check_smb_folder_write(next_unc, limiter, conn_timeout)
-                        if can_read or can_write:
-                            rw = f"READ={'YES' if can_read else 'NO'} WRITE={'YES' if can_write else 'NO'}"
-                            safe_print(Fore.MAGENTA + f"[FOLDER] {reason}: {next_unc} [{rw}]")
-                            tracker.add_folder_hit(next_unc, ent.name, reason, can_read, can_write)
-
-                    work_q.put(next_unc)
+                    work_q.put(dir_unc + "\\" + ent.name)
             finally:
                 work_q.task_done()
 
@@ -1543,11 +1543,12 @@ def generate_html_report(out_dir: str, folder_hits: list, filename_hits: list,
                 r_lbl = "YES" if hit["read"]  else "NO"
                 w_lbl = "YES" if hit["write"] else "NO"
             else:
-                badge = "&#x2014;"
-                r_cls = st_cls
-                r_lbl = "YES" if acc else "NO"
-                w_cls = ""
-                w_lbl = "&#x2014;"
+                badge   = "&#x2014;"
+                r_cls   = st_cls
+                r_lbl   = "YES" if acc else "NO"
+                wr      = d.get("write")
+                w_cls   = ("access-yes" if wr else "access-no") if wr is not None else ""
+                w_lbl   = ("YES" if wr else "NO") if wr is not None else "&#x2014;"
 
             all_dir_rows.append(
                 f'<tr class="alldir-row" data-path="{p_esc}">'
@@ -1615,7 +1616,7 @@ def generate_html_report(out_dir: str, folder_hits: list, filename_hits: list,
 
   {patt_section}
 
-  <h2>Sensitive Folders <span style="color:var(--muted);font-size:14px;font-weight:normal">({len(folder_hits)} found &#8212; click row for ACL details)</span></h2>
+  <h2>{"Folder Scan Results" if folders_only else "Sensitive Folders"} <span style="color:var(--muted);font-size:14px;font-weight:normal">({len(folder_hits)} found &#8212; click row for ACL details)</span></h2>
   {folder_section}
 
   {all_dirs_section}
