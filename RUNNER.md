@@ -36,7 +36,7 @@ pip install smbprotocol colorama cryptography
 
 `smbprotocol` is the SMB client library. Installing it also installs the `smbclient` Python module that APMAC imports directly. `cryptography` is a transitive dependency of `smbprotocol` and is also used by the Linux runner for credential encryption.
 
-### Linux — `smbclient` CLI tool
+### Linux - `smbclient` CLI tool
 
 APMAC uses the `smbclient` command-line tool (separate from the Python package) when enumerating shares from a bare `\\server` target with no share name specified. Install it for your distribution:
 
@@ -70,7 +70,7 @@ python --version
 python3 --version
 ```
 
-### Windows — Task Scheduler and ACL hardening
+### Windows - Task Scheduler and ACL hardening
 
 `runner_setup.py` must be run as **Administrator** to register the Task Scheduler job and apply `icacls` ACL restrictions to `runner.cred`. Right-click the terminal and choose *Run as administrator*, or:
 

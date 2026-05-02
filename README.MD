@@ -47,7 +47,7 @@ Or individually:
 pip install smbprotocol colorama cryptography
 ```
 
-**Linux — `smbclient` CLI** (optional, needed only for bare `\\server` share enumeration):
+**Linux - `smbclient` CLI** (optional, needed only for bare `\\server` share enumeration):
 
 ```bash
 # Debian / Ubuntu

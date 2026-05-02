@@ -326,7 +326,7 @@ def status_render(tracker, start_time: float) -> str:
     folders_only_mode = GLOBAL_FOLDERS_ONLY and total_q == 0
 
     if folders_only_mode:
-        # No file queue in -Fo mode — show folder-centric bar
+        # No file queue in -Fo mode - show folder-centric bar
         line = (
             f"{Fore.GREEN}[SCAN]{Fore.RESET} "
             f"Folders:{Fore.MAGENTA}{total_fh}{Fore.RESET} "
@@ -1173,15 +1173,15 @@ def smb_walk_folders_threaded(root_unc: str,
                 folder_name = dir_unc.rsplit("\\", 1)[-1] if "\\" in dir_unc else dir_unc
                 is_sens, reason = is_sensitive_folder(folder_name, _custom)
 
-                should_flag = is_sens or not flag_sensitive
+                # All Directories table - only populated when not in flag_sensitive mode
                 if not flag_sensitive:
                     tracker.add_dir(dir_unc, accessible=True, write=can_write)
 
-                if should_flag:
-                    label = reason if is_sens else folder_name
-                    rw    = f"READ=YES WRITE={'YES' if can_write else 'NO'}"
-                    safe_print(Fore.MAGENTA + f"[FOLDER] {label}: {dir_unc} [{rw}]")
-                    tracker.add_folder_hit(dir_unc, folder_name, label, True, can_write)
+                # Folder Scan Results + terminal output - ALWAYS sensitive matches only
+                if is_sens:
+                    rw = f"READ=YES WRITE={'YES' if can_write else 'NO'}"
+                    safe_print(Fore.MAGENTA + f"[FOLDER] {reason}: {dir_unc} [{rw}]")
+                    tracker.add_folder_hit(dir_unc, folder_name, reason, True, can_write)
 
                 status_update(tracker, start_time)
 
